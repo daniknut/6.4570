@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Windward Soundboard</title>
+<style>
+  :root {
+    --bg: #EAF0EE; --surface: #F7FAF9; --ink: #132220; --muted: #566866;
+    --line: #C7D3D0; --accent: #0B736E; --accent-ink: #FFFFFF; --bad: #B23A2E;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #0C1413; --surface: #13201E; --ink: #DDE9E6; --muted: #8FA3A0;
+      --line: #2A3B38; --accent: #3FBFB4; --accent-ink: #06201D; --bad: #EE8074;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0C1413; --surface: #13201E; --ink: #DDE9E6; --muted: #8FA3A0;
+    --line: #2A3B38; --accent: #3FBFB4; --accent-ink: #06201D; --bad: #EE8074;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, sans-serif; }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { margin: 0 0 4px; font-size: 26px; }
+  p { margin: 0 0 20px; color: var(--muted); }
+  table { width: 100%; border-collapse: separate; border-spacing: 6px; }
+  th { font-weight: 600; text-align: center; font-size: 14px; }
+  th small { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
+  th[scope="row"] { text-align: left; white-space: nowrap; padding-right: 4px; }
+  td button { width: 100%; height: 48px; font: 600 15px inherit; font-family: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+  td button:hover { border-color: var(--accent); }
+  td button:active, td button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; margin-top: 16px; }
+  .bar label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+  #stop { font: 600 14px inherit; font-family: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid var(--bad); color: var(--bad); background: var(--surface); cursor: pointer; }
+  #status { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Windward Soundboard</h1>
+  <p>Use headphones. Each button plays that sound from that direction. You're facing north. Wind stays on until you tap it again.</p>
+
+  <table>
+    <thead><tr><th></th></tr></thead>
+    <tbody id="grid"></tbody>
+  </table>
+
+  <div class="bar">
+    <button id="stop">Stop wind</button>
+    <label>Volume <input id="vol" type="range" min="0" max="100" value="80"></label>
+    <span id="status"></span>
+  </div>
+</div>
+
+<script>
+(() => {
+  const DIRS = [
+    { k: 'N', hint: 'ahead', a: 0 },
+    { k: 'E', hint: 'right', a: 90 },
+    { k: 'S', hint: 'behind', a: 180 },
+    { k: 'W', hint: 'left', a: 270 },
+  ];
+  // Recorded sounds in sounds/ (see sounds/SOURCES.md), how many variants each has.
+  const SETS = { door: 5, wall: 5, step: 5, keys: 7, cloth: 4, growl: 2, roar: 1, latch: 1 };
+  const SOUNDS = [
+    { name: 'Wind', wind: true },
+    { name: 'Door', play: (o) => { play('door', o); play('latch', o, 0.03, 0.3); } },
+    { name: 'Wall', play: (o) => { play('wall', o); play('cloth', o, 0, 0.55); } },
+    { name: 'Keys', play: (o) => play('keys', o, 0, 0.8) },
+    { name: 'Steps', play: (o) => { for (let k = 0; k < 4; k++) play('step', o, k * 0.5, 0.65); } },
+    { name: 'Growl', play: (o) => play('growl', o) },
+    { name: 'Roar', play: (o) => play('roar', o, 0, 1.1) },
+  ];
+  const ILD_DB = 4, REAR_DB = 6;
+
+  const $ = (id) => document.getElementById(id);
+  let ctx = null, master = null, noise = null;
+  const buffers = {};
+
+  function init() {
+    if (ctx) { if (ctx.state === 'suspended') ctx.resume(); return; }
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    master = ctx.createGain();
+    master.gain.value = $('vol').value / 100;
+    const comp = new DynamicsCompressorNode(ctx, { threshold: -10, knee: 6, ratio: 3 });
+    master.connect(comp).connect(ctx.destination);
+    noise = makeNoise(10);
+    loadSounds();
+  }
+
+  async function loadSounds() {
+    $('status').textContent = 'Loading sounds…';
+    const names = Object.entries(SETS).flatMap(([k, n]) => n === 1 ? [k] : Array.from({ length: n }, (_, i) => k + (i + 1)));
+    await Promise.all(names.map(async (n) => {
+      try {
+        const res = await fetch(`sounds/${n}.mp3`);
+        if (res.ok) buffers[n] = await ctx.decodeAudioData(await res.arrayBuffer());
+      } catch (e) { /* reported below */ }
+    }));
+    $('status').textContent = Object.keys(buffers).length
+      ? ''
+      : "Couldn't load sounds/. Open this page through a local server (e.g. python3 -m http.server).";
+  }
+
+  function pick(set) {
+    const n = SETS[set];
+    const list = n === 1 ? [buffers[set]] : Array.from({ length: n }, (_, i) => buffers[set + (i + 1)]);
+    const ok = list.filter(Boolean);
+    return ok[Math.floor(Math.random() * ok.length)];
+  }
+
+  // Binaural chain for one direction: HRTF panner, extra level difference
+  // between the ears, and duller treble for sounds behind you.
+  function spatial(deg) {
+    const r = deg * Math.PI / 180, s = Math.sin(r), c = Math.cos(r);
+    const input = ctx.createGain();
+    const shelf = new BiquadFilterNode(ctx, { type: 'highshelf', frequency: 2500, gain: -REAR_DB * Math.max(0, -c) });
+    const pan = new PannerNode(ctx, { panningModel: 'HRTF', rolloffFactor: 0, positionX: s, positionY: 0, positionZ: -c });
+    const split = ctx.createChannelSplitter(2), merge = ctx.createChannelMerger(2);
+    const gL = new GainNode(ctx, { gain: Math.pow(10, -ILD_DB * s / 40) });
+    const gR = new GainNode(ctx, { gain: Math.pow(10, ILD_DB * s / 40) });
+    input.connect(shelf).connect(pan).connect(split);
+    split.connect(gL, 0); split.connect(gR, 1);
+    gL.connect(merge, 0, 0); gR.connect(merge, 0, 1);
+    merge.connect(master);
+    return { input, out: merge };
+  }
+
+  function play(set, dir, delay = 0, gain = 1) {
+    const buf = pick(set);
+    if (!buf) return;
+    const src = new AudioBufferSourceNode(ctx, { buffer: buf, playbackRate: 0.95 + Math.random() * 0.1 });
+    src.connect(new GainNode(ctx, { gain })).connect(dir.input);
+    src.start(ctx.currentTime + 0.01 + delay);
+  }
+
+  function oneShot(sound, deg) {
+    const chain = spatial(deg);
+    sound.play(chain);
+    setTimeout(() => chain.out.disconnect(), 6000);
+  }
+
+  /* Wind: looping filtered noise with slow random gusts. */
+  function makeNoise(sec) {
+    const n = ctx.sampleRate * sec, buf = ctx.createBuffer(1, n, ctx.sampleRate), d = buf.getChannelData(0);
+    let b0 = 0, b1 = 0, b2 = 0;
+    for (let i = 0; i < n; i++) {
+      const w = Math.random() * 2 - 1;
+      b0 = 0.99765 * b0 + w * 0.099; b1 = 0.963 * b1 + w * 0.2965; b2 = 0.57 * b2 + w * 1.0527;
+      d[i] = (b0 + b1 + b2 + w * 0.1848) * 0.2;
+    }
+    return buf;
+  }
+
+  const winds = {};
+  function toggleWind(i, btn) {
+    if (winds[i]) {
+      const w = winds[i]; delete winds[i];
+      w.gate.gain.setTargetAtTime(0, ctx.currentTime, 0.15);
+      clearInterval(w.timer);
+      setTimeout(() => { w.src.stop(); w.chain.out.disconnect(); }, 1000);
+      btn.classList.remove('on');
+      return;
+    }
+    const chain = spatial(DIRS[i].a);
+    const src = new AudioBufferSourceNode(ctx, { buffer: noise, loop: true });
+    const body = new BiquadFilterNode(ctx, { type: 'lowpass', frequency: 3000, Q: 0.5 });
+    const whistle = new BiquadFilterNode(ctx, { type: 'bandpass', frequency: 700, Q: 6 });
+    const whistleG = new GainNode(ctx, { gain: 1.5 });
+    const gust = new GainNode(ctx, { gain: 0.5 });
+    const gate = new GainNode(ctx, { gain: 0 });
+    src.connect(body).connect(gust);
+    src.connect(whistle).connect(whistleG).connect(gust);
+    gust.connect(gate).connect(chain.input);
+    src.start(0, Math.random() * 10);
+    gate.gain.setTargetAtTime(0.6, ctx.currentTime, 0.2);
+    let drive = 0.5;
+    const pitch = [1, 0.86, 0.93, 1.1][i];
+    const timer = setInterval(() => {
+      drive = Math.min(1, Math.max(0, drive + (Math.random() - 0.5) * 0.12 + (0.5 - drive) * 0.02));
+      const t = ctx.currentTime;
+      gust.gain.setTargetAtTime(0.3 + 0.7 * drive, t, 0.1);
+      whistle.frequency.setTargetAtTime((450 + 700 * drive) * pitch, t, 0.2);
+    }, 50);
+    winds[i] = { src, gate, chain, timer };
+    btn.classList.add('on');
+  }
+
+  /* UI */
+  const headRow = document.querySelector('thead tr');
+  DIRS.forEach((d) => {
+    const th = document.createElement('th');
+    th.scope = 'col';
+    th.innerHTML = `${d.k}<small>${d.hint}</small>`;
+    headRow.appendChild(th);
+  });
+  const windBtns = [];
+  SOUNDS.forEach((sound) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<th scope="row">${sound.name}</th>`;
+    DIRS.forEach((d, i) => {
+      const td = document.createElement('td'), btn = document.createElement('button');
+      btn.textContent = d.k;
+      btn.setAttribute('aria-label', `${sound.name} from ${d.hint}`);
+      btn.addEventListener('click', () => {
+        init();
+        if (sound.wind) toggleWind(i, btn); else oneShot(sound, d.a);
+      });
+      if (sound.wind) windBtns[i] = btn;
+      td.appendChild(btn); tr.appendChild(td);
+    });
+    $('grid').appendChild(tr);
+  });
+
+  $('stop').addEventListener('click', () => {
+    Object.keys(winds).forEach((i) => toggleWind(+i, windBtns[i]));
+  });
+  $('vol').addEventListener('input', (e) => {
+    if (master) master.gain.setTargetAtTime(e.target.value / 100, ctx.currentTime, 0.02);
+  });
+})();
+</script>
+</body>
+</html>
